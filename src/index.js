@@ -16,6 +16,8 @@ const OUTPUT_DIR = path.resolve(__dirname, "../output");
 const BOOKS_FILE = path.join(OUTPUT_DIR, "books.json");
 const ERRORS_FILE = path.join(OUTPUT_DIR, "errors.json");
 const REPORT_FILE = path.join(OUTPUT_DIR, "run-report.json");
+const CSV_FILE = path.join(OUTPUT_DIR, "books.csv");
+const DASHBOARD_FILE = path.join(OUTPUT_DIR, "dashboard.html");
 const CHANGE_REPORT_FILE = path.join(OUTPUT_DIR, "change-report.json");
 const BASELINE_FILE = path.join(OUTPUT_DIR, "baseline-books.json");
 
@@ -329,6 +331,221 @@ async function writeJson(filePath, data) {
   await fs.rename(temporaryPath, filePath);
 }
 
+function csvCell(value) {
+  // Nullable values become empty CSV cells.
+  const text = value == null ? "" : String(value);
+
+  // Quote every cell and escape embedded double quotes.
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+async function writeCsv(books) {
+  const columns = [
+    "title",
+    "product_url",
+    "price_text",
+    "price_gbp",
+    "availability_text",
+    "rating_text",
+    "description",
+    "source_page",
+    "fetched_at",
+  ];
+
+  const lines = [
+    columns.map(csvCell).join(","),
+    ...books.map((book) =>
+      columns.map((column) => csvCell(book[column])).join(","),
+    ),
+  ];
+
+  await fs.mkdir(OUTPUT_DIR, { recursive: true });
+  await fs.writeFile(CSV_FILE, `${lines.join("\r\n")}\r\n`, "utf8");
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatPrice(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "N/A";
+  }
+
+  return `£${value.toFixed(2)}`;
+}
+
+async function writeDashboard(runReport, books, invalidRecords) {
+  const prices = books
+    .map((book) => book.price_gbp)
+    .filter((price) => typeof price === "number" && Number.isFinite(price));
+
+  const minPrice = prices.length ? Math.min(...prices) : null;
+  const maxPrice = prices.length ? Math.max(...prices) : null;
+
+  const failures = runReport.failed_pages ?? [];
+  const completedAt = runReport.ended_at
+    ? new Date(runReport.ended_at).toLocaleString("en-GB", {
+        dateStyle: "medium",
+        timeStyle: "medium",
+        timeZone: "UTC",
+      }) + " UTC"
+    : "Not available";
+
+  const failureRows = failures.length
+    ? failures
+        .map(
+          (failure) => `
+            <tr>
+              <td>${escapeHtml(failure.stage)}</td>
+              <td class="url">${escapeHtml(failure.url)}</td>
+              <td>${escapeHtml(failure.reason)}</td>
+            </tr>`,
+        )
+        .join("")
+    : `<tr><td colspan="3" class="empty">No failed page requests recorded.</td></tr>`;
+
+  const changeSummary = runReport.change_detection
+    ? `
+      <p>
+        <strong>Change comparison:</strong>
+        ${runReport.change_detection.comparison_complete ? "Complete" : "Incomplete"}
+      </p>
+      <p>
+        New: ${runReport.change_detection.new} ·
+        Changed: ${runReport.change_detection.changed} ·
+        Unchanged: ${runReport.change_detection.unchanged} ·
+        Gone: ${runReport.change_detection.gone}
+      </p>`
+    : "<p>No change comparison was generated for this run.</p>";
+
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>A9 Scraper Dashboard</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f4f6fa;
+      color: #172033;
+    }
+    body {
+      max-width: 1050px;
+      margin: 0 auto;
+      padding: 32px 20px;
+    }
+    h1, h2 { letter-spacing: -0.03em; }
+    .muted { color: #667085; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 16px;
+      margin: 24px 0;
+    }
+    .card, section {
+      background: #fff;
+      border: 1px solid #e1e6ef;
+      border-radius: 12px;
+      padding: 20px;
+    }
+    .metric {
+      display: block;
+      font-size: 1.8rem;
+      font-weight: 700;
+      margin-top: 8px;
+      overflow-wrap: anywhere;
+    }
+    section { margin-top: 20px; }
+    .table-wrap { overflow-x: auto; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+    }
+    th, td {
+      padding: 12px;
+      border-bottom: 1px solid #e8ecf2;
+      vertical-align: top;
+    }
+    th { background: #f8fafc; }
+    .url { overflow-wrap: anywhere; }
+    .empty { color: #667085; text-align: center; }
+    a { color: #2459b8; }
+    @media (max-width: 600px) {
+      body { padding: 20px 12px; }
+      .card, section { padding: 15px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>A9 Scraper Dashboard</h1>
+    <p class="muted">Books to Scrape · First three catalogue pages</p>
+    <p>Last run completed: <strong>${escapeHtml(completedAt)}</strong></p>
+  </header>
+
+  <div class="grid">
+    <article class="card">
+      <span class="muted">Valid book records</span>
+      <strong class="metric">${books.length}</strong>
+    </article>
+    <article class="card">
+      <span class="muted">Price range</span>
+      <strong class="metric">${escapeHtml(formatPrice(minPrice))} – ${escapeHtml(formatPrice(maxPrice))}</strong>
+    </article>
+    <article class="card">
+      <span class="muted">Failed page requests</span>
+      <strong class="metric">${failures.length}</strong>
+    </article>
+    <article class="card">
+      <span class="muted">Invalid records</span>
+      <strong class="metric">${invalidRecords.length}</strong>
+    </article>
+  </div>
+
+  <section>
+    <h2>Run statistics</h2>
+    <p>Catalogue pages processed: ${runReport.catalogue_pages_processed ?? 0}</p>
+    <p>Successful network fetches: ${runReport.pages_fetched ?? 0}</p>
+    <p>Cache hits: ${runReport.cache_hits ?? 0}</p>
+    <p>Run duration: ${runReport.duration_ms ?? 0} ms</p>
+    ${changeSummary}
+  </section>
+
+  <section>
+    <h2>Failed page requests</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Stage</th><th>URL</th><th>Reason</th></tr>
+        </thead>
+        <tbody>${failureRows}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    <p class="muted">
+      Generated locally by the A9 scraper. Refresh this file after another run
+      to view the latest saved statistics.
+    </p>
+    <p><a href="books.csv">Open CSV export</a></p>
+  </footer>
+</body>
+</html>`;
+
+  await fs.mkdir(OUTPUT_DIR, { recursive: true });
+  await fs.writeFile(DASHBOARD_FILE, html, "utf8");
+}
+
 async function readJsonIfExists(filePath, fallback) {
   try {
     return JSON.parse(await fs.readFile(filePath, "utf8"));
@@ -548,10 +765,15 @@ async function main() {
 
     try {
       await writeJson(REPORT_FILE, runReport);
+      await writeCsv(validRecords);
+      await writeDashboard(runReport, validRecords, invalidRecords);
+
       console.log(`\nRun report saved to ${REPORT_FILE}`);
-    } catch (reportError) {
-      console.error(`Could not write run report: ${reportError.message}`);
-      fatalError = fatalError || reportError;
+      console.log(`CSV export saved to ${CSV_FILE}`);
+      console.log(`Dashboard saved to ${DASHBOARD_FILE}`);
+    } catch (outputError) {
+      console.error(`Could not write generated output: ${outputError.message}`);
+      fatalError = fatalError || outputError;
     }
   }
 

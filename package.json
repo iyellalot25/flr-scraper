@@ -1,7 +1,7 @@
 {
   "name": "flr-scraper",
   "version": "1.0.0",
-  "description": "",
+  "description": "A polite, cached web scraper for Books to Scrape built with Node.js, Cheerio, and Zod.",
   "homepage": "https://github.com/iyellalot25/flr-scraper#readme",
   "bugs": {
     "url": "https://github.com/iyellalot25/flr-scraper/issues"
@@ -15,8 +15,9 @@
   "type": "commonjs",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "npx nodemon src/index.js"
+    "test": "echo \"Tests not configured for this assignment\"",
+    "dev": "npx nodemon src/index.js",
+    "start": "node src/index.js"
   },
   "dependencies": {
     "cheerio": "^1.2.0",
