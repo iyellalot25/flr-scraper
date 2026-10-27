@@ -20,12 +20,12 @@ function sleep(ms) {
 async function fetchWithCache(url, cacheFile) {
   const cachePath = path.join(CACHE_DIR, cacheFile);
 
-  // Reuse cached HTML without making a network request.
   try {
     const html = await fs.readFile(cachePath, "utf8");
 
-    console.log(`CACHE HIT ${cacheFile}`);
-    console.log(`response_size_bytes=${Buffer.byteLength(html, "utf8")}`);
+    console.log(
+      `CACHE HIT ${cacheFile} response_size_bytes=${Buffer.byteLength(html, "utf8")}`,
+    );
 
     return html;
   } catch (error) {
@@ -43,7 +43,6 @@ async function fetchWithCache(url, cacheFile) {
   }
 
   console.log(`FETCH ${url}`);
-
   lastRequestStartedAt = Date.now();
 
   const response = await fetch(url, {
@@ -54,7 +53,6 @@ async function fetchWithCache(url, cacheFile) {
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
 
-  // Only a successful HTTP 200 response can enter the cache.
   if (response.status !== 200) {
     await response.body?.cancel();
 
@@ -66,7 +64,7 @@ async function fetchWithCache(url, cacheFile) {
   const html = await response.text();
   const sizeBytes = Buffer.byteLength(html, "utf8");
 
-  await fs.mkdir(CACHE_DIR, { recursive: true });
+  await fs.mkdir(path.dirname(cachePath), { recursive: true });
   await fs.writeFile(cachePath, html, "utf8");
 
   console.log(`status=${response.status}`);
@@ -77,19 +75,21 @@ async function fetchWithCache(url, cacheFile) {
 }
 
 async function discoverCatalogue() {
-  const bookUrls = new Set();
+  const discoveredBooks = [];
+  const uniqueUrls = new Set();
+
   let currentUrl = START_URL;
-  let discovered = 0;
   let cataloguePages = 0;
+  let discovered = 0;
 
   while (currentUrl && cataloguePages < MAX_CATALOGUE_PAGES) {
     cataloguePages++;
 
+    const sourcePage = currentUrl;
     const cacheFile = `catalogue-page-${cataloguePages}.html`;
-    const html = await fetchWithCache(currentUrl, cacheFile);
+    const html = await fetchWithCache(sourcePage, cacheFile);
     const $ = cheerio.load(html);
 
-    // Extract book links only from catalogue product cards.
     $(".product_pod h3 a").each((_, element) => {
       const href = $(element).attr("href");
 
@@ -99,9 +99,16 @@ async function discoverCatalogue() {
 
       discovered++;
 
-      // Resolve relative URLs using the current catalogue URL.
-      const absoluteUrl = new URL(href, currentUrl).href;
-      bookUrls.add(absoluteUrl);
+      const productUrl = new URL(href, sourcePage).href;
+
+      if (!uniqueUrls.has(productUrl)) {
+        uniqueUrls.add(productUrl);
+
+        discoveredBooks.push({
+          product_url: productUrl,
+          source_page: sourcePage,
+        });
+      }
     });
 
     console.log(
@@ -112,7 +119,6 @@ async function discoverCatalogue() {
       break;
     }
 
-    // Follow the site's own next-page link.
     const nextHref = $("li.next a").attr("href");
 
     if (!nextHref) {
@@ -121,35 +127,97 @@ async function discoverCatalogue() {
       );
     }
 
-    currentUrl = new URL(nextHref, currentUrl).href;
-  }
-
-  if (cataloguePages !== MAX_CATALOGUE_PAGES) {
-    throw new Error(
-      `Expected ${MAX_CATALOGUE_PAGES} catalogue pages, found ${cataloguePages}`,
-    );
+    currentUrl = new URL(nextHref, sourcePage).href;
   }
 
   console.log("\n--- Catalogue discovery summary ---");
   console.log(`catalogue_pages=${cataloguePages}`);
   console.log(`discovered=${discovered}`);
-  console.log(`unique_urls=${bookUrls.size}`);
+  console.log(`unique_urls=${uniqueUrls.size}`);
 
-  if (discovered !== 60 || bookUrls.size !== 60) {
+  if (
+    cataloguePages !== MAX_CATALOGUE_PAGES ||
+    discovered !== 60 ||
+    uniqueUrls.size !== 60
+  ) {
     throw new Error(
-      `Expected 60 discovered and unique book URLs; got ${discovered} discovered and ${bookUrls.size} unique`,
+      `Expected 3 pages, 60 discovered URLs and 60 unique URLs; got ${cataloguePages}, ${discovered} and ${uniqueUrls.size}`,
     );
   }
 
-  return [...bookUrls];
+  return discoveredBooks;
+}
+
+function extractBookRecord(html, book, fetchedAt) {
+  const $ = cheerio.load(html);
+
+  const text = (selector) => {
+    const value = $(selector).first().text().replace(/\s+/g, " ").trim();
+    return value || null;
+  };
+
+  const ratingClass = $("p.star-rating")
+    .first()
+    .attr("class")
+    ?.split(/\s+/)
+    .find((className) =>
+      ["One", "Two", "Three", "Four", "Five"].includes(className),
+    );
+
+  const descriptionElement = $("#product_description").nextAll("p").first();
+  const descriptionText = descriptionElement.length
+    ? descriptionElement.text().replace(/\s+/g, " ").trim()
+    : "";
+
+  return {
+    title: text(".product_main h1"),
+    product_url: book.product_url,
+    price_text: text(".product_main .price_color"),
+    availability_text: text(".product_main .availability"),
+    rating_text: ratingClass ?? null,
+    description: descriptionText || null,
+    source_page: book.source_page,
+    fetched_at: fetchedAt,
+  };
+}
+
+async function extractBookDetails(books) {
+  const records = [];
+
+  for (let index = 0; index < books.length; index++) {
+    const book = books[index];
+
+    // Stable cache filenames prevent duplicates on reruns.
+    const cacheFile = `books/book-${String(index + 1).padStart(3, "0")}.html`;
+
+    console.log(`\nBOOK ${index + 1}/${books.length}`);
+
+    const html = await fetchWithCache(book.product_url, cacheFile);
+    const fetchedAt = new Date().toISOString();
+
+    const record = extractBookRecord(html, book, fetchedAt);
+    records.push(record);
+  }
+
+  return records;
 }
 
 async function main() {
-  const bookUrls = await discoverCatalogue();
+  const books = await discoverCatalogue();
 
-  // Keep the discovered URLs available for the next stage.
-  // Stage 3 will fetch these detail pages.
-  console.log(`discovery_complete=${bookUrls.length === 60}`);
+  console.log("\n--- Extracting book details ---");
+
+  const records = await extractBookDetails(books);
+
+  console.log("\n--- Sample raw record ---");
+  console.log(JSON.stringify(records[0], null, 2));
+
+  console.log("\n--- Detail extraction summary ---");
+  console.log(`detail_pages=${records.length}`);
+
+  if (records.length !== 60) {
+    throw new Error(`Expected 60 detail records, got ${records.length}`);
+  }
 }
 
 main().catch((error) => {
