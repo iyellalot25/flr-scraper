@@ -1,6 +1,7 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const cheerio = require("cheerio");
+const { z } = require("zod");
 
 const START_URL = "https://books.toscrape.com/";
 const USER_AGENT =
@@ -10,8 +11,24 @@ const MIN_DELAY_MS = 500;
 const MAX_CATALOGUE_PAGES = 3;
 
 const CACHE_DIR = path.resolve(__dirname, "../cache");
+const OUTPUT_DIR = path.resolve(__dirname, "../output");
+const BOOKS_FILE = path.join(OUTPUT_DIR, "books.json");
+const ERRORS_FILE = path.join(OUTPUT_DIR, "errors.json");
 
 let lastRequestStartedAt = 0;
+
+// Validate the final, normalized record.
+const bookSchema = z.object({
+  title: z.string().trim().min(1),
+  product_url: z.string().url(),
+  price_text: z.string().trim().min(1),
+  price_gbp: z.number().finite().nonnegative(),
+  availability_text: z.string().trim().min(1),
+  rating_text: z.enum(["One", "Two", "Three", "Four", "Five"]).nullable(),
+  description: z.string().nullable(),
+  source_page: z.string().url(),
+  fetched_at: z.string().datetime(),
+});
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -29,18 +46,14 @@ async function fetchWithCache(url, cacheFile) {
 
     return html;
   } catch (error) {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
+    if (error.code !== "ENOENT") throw error;
   }
 
-  // Enforce at least 500 ms between real request start times.
+  // Keep at least 500 ms between real request start times.
   const elapsed = Date.now() - lastRequestStartedAt;
   const waitMs = Math.max(0, MIN_DELAY_MS - elapsed);
 
-  if (waitMs > 0) {
-    await sleep(waitMs);
-  }
+  if (waitMs > 0) await sleep(waitMs);
 
   console.log(`FETCH ${url}`);
   lastRequestStartedAt = Date.now();
@@ -55,7 +68,6 @@ async function fetchWithCache(url, cacheFile) {
 
   if (response.status !== 200) {
     await response.body?.cancel();
-
     throw new Error(
       `HTTP ${response.status} ${response.statusText} for ${url}`,
     );
@@ -92,10 +104,7 @@ async function discoverCatalogue() {
 
     $(".product_pod h3 a").each((_, element) => {
       const href = $(element).attr("href");
-
-      if (!href) {
-        return;
-      }
+      if (!href) return;
 
       discovered++;
 
@@ -103,7 +112,6 @@ async function discoverCatalogue() {
 
       if (!uniqueUrls.has(productUrl)) {
         uniqueUrls.add(productUrl);
-
         discoveredBooks.push({
           product_url: productUrl,
           source_page: sourcePage,
@@ -115,9 +123,7 @@ async function discoverCatalogue() {
       `catalogue_page=${cataloguePages} books_found=${$(".product_pod h3 a").length}`,
     );
 
-    if (cataloguePages === MAX_CATALOGUE_PAGES) {
-      break;
-    }
+    if (cataloguePages === MAX_CATALOGUE_PAGES) break;
 
     const nextHref = $("li.next a").attr("href");
 
@@ -181,13 +187,30 @@ function extractBookRecord(html, book, fetchedAt) {
   };
 }
 
+function normalizePrice(priceText) {
+  if (typeof priceText !== "string") return null;
+
+  // Accept the expected GBP format, e.g. £51.77.
+  const match = priceText.trim().match(/^£\s*(\d+(?:\.\d{1,2})?)$/);
+
+  if (!match) return null;
+
+  const price = Number(match[1]);
+  return Number.isFinite(price) ? price : null;
+}
+
+function normalizeBookRecord(rawRecord) {
+  return {
+    ...rawRecord,
+    price_gbp: normalizePrice(rawRecord.price_text),
+  };
+}
+
 async function extractBookDetails(books) {
   const records = [];
 
   for (let index = 0; index < books.length; index++) {
     const book = books[index];
-
-    // Stable cache filenames prevent duplicates on reruns.
     const cacheFile = `books/book-${String(index + 1).padStart(3, "0")}.html`;
 
     console.log(`\nBOOK ${index + 1}/${books.length}`);
@@ -195,11 +218,68 @@ async function extractBookDetails(books) {
     const html = await fetchWithCache(book.product_url, cacheFile);
     const fetchedAt = new Date().toISOString();
 
-    const record = extractBookRecord(html, book, fetchedAt);
-    records.push(record);
+    records.push(extractBookRecord(html, book, fetchedAt));
   }
 
   return records;
+}
+
+function validateRecords(rawRecords) {
+  const validRecords = [];
+  const invalidRecords = [];
+  const seenUrls = new Set();
+
+  for (const rawRecord of rawRecords) {
+    const normalizedRecord = normalizeBookRecord(rawRecord);
+    const result = bookSchema.safeParse(normalizedRecord);
+
+    if (!result.success) {
+      invalidRecords.push({
+        product_url: rawRecord.product_url,
+        record: normalizedRecord,
+        errors: result.error.issues.map((issue) => ({
+          field: issue.path.join("."),
+          message: issue.message,
+        })),
+      });
+
+      continue;
+    }
+
+    // Defend against duplicate product URLs before writing output.
+    if (seenUrls.has(result.data.product_url)) {
+      invalidRecords.push({
+        product_url: result.data.product_url,
+        record: result.data,
+        errors: [
+          {
+            field: "product_url",
+            message: "Duplicate product URL",
+          },
+        ],
+      });
+
+      continue;
+    }
+
+    seenUrls.add(result.data.product_url);
+    validRecords.push(result.data);
+  }
+
+  return { validRecords, invalidRecords };
+}
+
+async function writeJson(filePath, data) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+
+  // Write to a temporary file first to avoid leaving partial JSON output.
+  const temporaryPath = `${filePath}.tmp`;
+  await fs.writeFile(
+    temporaryPath,
+    `${JSON.stringify(data, null, 2)}\n`,
+    "utf8",
+  );
+  await fs.rename(temporaryPath, filePath);
 }
 
 async function main() {
@@ -207,16 +287,42 @@ async function main() {
 
   console.log("\n--- Extracting book details ---");
 
-  const records = await extractBookDetails(books);
+  const rawRecords = await extractBookDetails(books);
 
   console.log("\n--- Sample raw record ---");
-  console.log(JSON.stringify(records[0], null, 2));
+  console.log(JSON.stringify(rawRecords[0], null, 2));
 
   console.log("\n--- Detail extraction summary ---");
-  console.log(`detail_pages=${records.length}`);
+  console.log(`detail_pages=${rawRecords.length}`);
 
-  if (records.length !== 60) {
-    throw new Error(`Expected 60 detail records, got ${records.length}`);
+  if (rawRecords.length !== 60) {
+    throw new Error(`Expected 60 detail records, got ${rawRecords.length}`);
+  }
+
+  const { validRecords, invalidRecords } = validateRecords(rawRecords);
+
+  await writeJson(BOOKS_FILE, validRecords);
+  await writeJson(ERRORS_FILE, invalidRecords);
+
+  console.log("\n--- Validation and storage summary ---");
+  console.log(`valid_records=${validRecords.length}`);
+  console.log(`invalid_records=${invalidRecords.length}`);
+  console.log(
+    `unique_valid_urls=${new Set(validRecords.map((book) => book.product_url)).size}`,
+  );
+  console.log(`books_output=${path.relative(process.cwd(), BOOKS_FILE)}`);
+  console.log(`errors_output=${path.relative(process.cwd(), ERRORS_FILE)}`);
+
+  if (invalidRecords.length > 0) {
+    console.warn(
+      `${invalidRecords.length} record(s) failed validation. Inspect output/errors.json.`,
+    );
+  }
+
+  if (validRecords.length !== 60 || invalidRecords.length !== 0) {
+    throw new Error(
+      `Expected 60 valid records and 0 invalid records; got ${validRecords.length} valid and ${invalidRecords.length} invalid.`,
+    );
   }
 }
 
