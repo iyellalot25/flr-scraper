@@ -1,6 +1,6 @@
 # The Polite Scraper
 
-A JavaScript-based web scraping pipeline built for the FlyRank Internship — Backend Track, Week 5.
+A JavaScript-based web scraping pipeline.
 
 The scraper collects book data from the first three catalogue pages of [Books to Scrape](https://books.toscrape.com/), validates and normalizes the records, and generates JSON, CSV, change reports, and a local HTML dashboard.
 
