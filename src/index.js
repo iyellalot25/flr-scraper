@@ -1,5 +1,6 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const cheerio = require("cheerio");
 const { z } = require("zod");
 
@@ -14,10 +15,21 @@ const CACHE_DIR = path.resolve(__dirname, "../cache");
 const OUTPUT_DIR = path.resolve(__dirname, "../output");
 const BOOKS_FILE = path.join(OUTPUT_DIR, "books.json");
 const ERRORS_FILE = path.join(OUTPUT_DIR, "errors.json");
+const REPORT_FILE = path.join(OUTPUT_DIR, "run-report.json");
+const CHANGE_REPORT_FILE = path.join(OUTPUT_DIR, "change-report.json");
+const BASELINE_FILE = path.join(OUTPUT_DIR, "baseline-books.json");
+
+const TEST_BROKEN_PAGE = process.argv.includes("--test-broken-page");
 
 let lastRequestStartedAt = 0;
 
-// Validate the final, normalized record.
+const metrics = {
+  pagesFetched: 0,
+  cacheHits: 0,
+  cataloguePagesProcessed: 0,
+  failedPages: [],
+};
+
 const bookSchema = z.object({
   title: z.string().trim().min(1),
   product_url: z.string().url(),
@@ -34,11 +46,12 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWithCache(url, cacheFile) {
+async function fetchWithCache(url, cacheFile, stage) {
   const cachePath = path.join(CACHE_DIR, cacheFile);
 
   try {
     const html = await fs.readFile(cachePath, "utf8");
+    metrics.cacheHits++;
 
     console.log(
       `CACHE HIT ${cacheFile} response_size_bytes=${Buffer.byteLength(html, "utf8")}`,
@@ -49,7 +62,6 @@ async function fetchWithCache(url, cacheFile) {
     if (error.code !== "ENOENT") throw error;
   }
 
-  // Keep at least 500 ms between real request start times.
   const elapsed = Date.now() - lastRequestStartedAt;
   const waitMs = Math.max(0, MIN_DELAY_MS - elapsed);
 
@@ -58,32 +70,44 @@ async function fetchWithCache(url, cacheFile) {
   console.log(`FETCH ${url}`);
   lastRequestStartedAt = Date.now();
 
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      Accept: "text/html",
-    },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "text/html",
+      },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
 
-  if (response.status !== 200) {
-    await response.body?.cancel();
-    throw new Error(
-      `HTTP ${response.status} ${response.statusText} for ${url}`,
-    );
+    if (response.status !== 200) {
+      await response.body?.cancel();
+      throw new Error(
+        `HTTP ${response.status} ${response.statusText} for ${url}`,
+      );
+    }
+
+    const html = await response.text();
+
+    await fs.mkdir(path.dirname(cachePath), { recursive: true });
+    await fs.writeFile(cachePath, html, "utf8");
+
+    metrics.pagesFetched++;
+
+    console.log(`status=${response.status}`);
+    console.log(`response_size_bytes=${Buffer.byteLength(html, "utf8")}`);
+    console.log(`cached_file=${cacheFile}`);
+
+    return html;
+  } catch (error) {
+    metrics.failedPages.push({
+      url,
+      stage,
+      reason: error.message,
+      failed_at: new Date().toISOString(),
+    });
+
+    throw error;
   }
-
-  const html = await response.text();
-  const sizeBytes = Buffer.byteLength(html, "utf8");
-
-  await fs.mkdir(path.dirname(cachePath), { recursive: true });
-  await fs.writeFile(cachePath, html, "utf8");
-
-  console.log(`status=${response.status}`);
-  console.log(`response_size_bytes=${sizeBytes}`);
-  console.log(`cached_file=${cacheFile}`);
-
-  return html;
 }
 
 async function discoverCatalogue() {
@@ -96,10 +120,11 @@ async function discoverCatalogue() {
 
   while (currentUrl && cataloguePages < MAX_CATALOGUE_PAGES) {
     cataloguePages++;
+    metrics.cataloguePagesProcessed = cataloguePages;
 
     const sourcePage = currentUrl;
     const cacheFile = `catalogue-page-${cataloguePages}.html`;
-    const html = await fetchWithCache(sourcePage, cacheFile);
+    const html = await fetchWithCache(sourcePage, cacheFile, "catalogue");
     const $ = cheerio.load(html);
 
     $(".product_pod h3 a").each((_, element) => {
@@ -190,7 +215,6 @@ function extractBookRecord(html, book, fetchedAt) {
 function normalizePrice(priceText) {
   if (typeof priceText !== "string") return null;
 
-  // Accept the expected GBP format, e.g. £51.77.
   const match = priceText.trim().match(/^£\s*(\d+(?:\.\d{1,2})?)$/);
 
   if (!match) return null;
@@ -207,18 +231,43 @@ function normalizeBookRecord(rawRecord) {
 }
 
 async function extractBookDetails(books) {
+  const tasks = [...books];
+
+  // Optional test: exercise failure isolation without changing the real catalogue.
+  if (TEST_BROKEN_PAGE) {
+    tasks.push({
+      product_url:
+        "https://books.toscrape.com/catalogue/this-page-intentionally-does-not-exist_99999/index.html",
+      source_page: START_URL,
+      test_only: true,
+    });
+  }
+
   const records = [];
 
-  for (let index = 0; index < books.length; index++) {
-    const book = books[index];
-    const cacheFile = `books/book-${String(index + 1).padStart(3, "0")}.html`;
+  for (let index = 0; index < tasks.length; index++) {
+    const book = tasks[index];
+    const cacheFile = book.test_only
+      ? "books/test-broken-page.html"
+      : `books/book-${String(index + 1).padStart(3, "0")}.html`;
 
-    console.log(`\nBOOK ${index + 1}/${books.length}`);
+    console.log(`\nBOOK ${index + 1}/${tasks.length}`);
 
-    const html = await fetchWithCache(book.product_url, cacheFile);
-    const fetchedAt = new Date().toISOString();
+    try {
+      const html = await fetchWithCache(book.product_url, cacheFile, "detail");
 
-    records.push(extractBookRecord(html, book, fetchedAt));
+      // The deliberate test URL must never enter the actual book output.
+      if (book.test_only) continue;
+
+      const record = extractBookRecord(html, book, new Date().toISOString());
+
+      records.push(record);
+    } catch (error) {
+      console.error(
+        `SKIPPED detail page: ${book.product_url}\nReason: ${error.message}`,
+      );
+      // Continue with the next detail page.
+    }
   }
 
   return records;
@@ -242,11 +291,9 @@ function validateRecords(rawRecords) {
           message: issue.message,
         })),
       });
-
       continue;
     }
 
-    // Defend against duplicate product URLs before writing output.
     if (seenUrls.has(result.data.product_url)) {
       invalidRecords.push({
         product_url: result.data.product_url,
@@ -258,7 +305,6 @@ function validateRecords(rawRecords) {
           },
         ],
       });
-
       continue;
     }
 
@@ -272,61 +318,244 @@ function validateRecords(rawRecords) {
 async function writeJson(filePath, data) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
 
-  // Write to a temporary file first to avoid leaving partial JSON output.
   const temporaryPath = `${filePath}.tmp`;
+
   await fs.writeFile(
     temporaryPath,
     `${JSON.stringify(data, null, 2)}\n`,
     "utf8",
   );
+
   await fs.rename(temporaryPath, filePath);
 }
 
-async function main() {
-  const books = await discoverCatalogue();
-
-  console.log("\n--- Extracting book details ---");
-
-  const rawRecords = await extractBookDetails(books);
-
-  console.log("\n--- Sample raw record ---");
-  console.log(JSON.stringify(rawRecords[0], null, 2));
-
-  console.log("\n--- Detail extraction summary ---");
-  console.log(`detail_pages=${rawRecords.length}`);
-
-  if (rawRecords.length !== 60) {
-    throw new Error(`Expected 60 detail records, got ${rawRecords.length}`);
-  }
-
-  const { validRecords, invalidRecords } = validateRecords(rawRecords);
-
-  await writeJson(BOOKS_FILE, validRecords);
-  await writeJson(ERRORS_FILE, invalidRecords);
-
-  console.log("\n--- Validation and storage summary ---");
-  console.log(`valid_records=${validRecords.length}`);
-  console.log(`invalid_records=${invalidRecords.length}`);
-  console.log(
-    `unique_valid_urls=${new Set(validRecords.map((book) => book.product_url)).size}`,
-  );
-  console.log(`books_output=${path.relative(process.cwd(), BOOKS_FILE)}`);
-  console.log(`errors_output=${path.relative(process.cwd(), ERRORS_FILE)}`);
-
-  if (invalidRecords.length > 0) {
-    console.warn(
-      `${invalidRecords.length} record(s) failed validation. Inspect output/errors.json.`,
-    );
-  }
-
-  if (validRecords.length !== 60 || invalidRecords.length !== 0) {
-    throw new Error(
-      `Expected 60 valid records and 0 invalid records; got ${validRecords.length} valid and ${invalidRecords.length} invalid.`,
-    );
+async function readJsonIfExists(filePath, fallback) {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return fallback;
+    throw error;
   }
 }
 
-main().catch((error) => {
-  console.error(`Scraper failed: ${error.message}`);
-  process.exitCode = 1;
-});
+// Exclude fetched_at so a new run timestamp doesn't count as a content change.
+const CHANGE_FIELDS = [
+  "title",
+  "price_text",
+  "price_gbp",
+  "availability_text",
+  "rating_text",
+  "description",
+];
+
+function contentHash(book) {
+  const content = {};
+
+  for (const field of CHANGE_FIELDS) {
+    content[field] = book[field];
+  }
+
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(content))
+    .digest("hex");
+}
+
+function changedFields(previous, current) {
+  return CHANGE_FIELDS.filter((field) => previous[field] !== current[field]);
+}
+
+function compareSnapshots(currentBooks, previousBooks, comparisonComplete) {
+  const previousByUrl = new Map(
+    previousBooks.map((book) => [book.product_url, book]),
+  );
+
+  const currentByUrl = new Map(
+    currentBooks.map((book) => [book.product_url, book]),
+  );
+
+  const changes = {
+    comparison_complete: comparisonComplete,
+    baseline_count: previousBooks.length,
+    current_count: currentBooks.length,
+    new: [],
+    changed: [],
+    unchanged: [],
+    gone: [],
+  };
+
+  for (const current of currentBooks) {
+    const previous = previousByUrl.get(current.product_url);
+
+    if (!previous) {
+      changes.new.push({
+        product_url: current.product_url,
+        title: current.title,
+        hash: contentHash(current),
+      });
+      continue;
+    }
+
+    const previousHash = contentHash(previous);
+    const currentHash = contentHash(current);
+
+    if (previousHash !== currentHash) {
+      changes.changed.push({
+        product_url: current.product_url,
+        title: current.title,
+        previous_hash: previousHash,
+        current_hash: currentHash,
+        changed_fields: changedFields(previous, current),
+      });
+    } else {
+      changes.unchanged.push(current.product_url);
+    }
+  }
+
+  // Never infer removals from a partial scrape.
+  if (comparisonComplete) {
+    for (const previous of previousBooks) {
+      if (!currentByUrl.has(previous.product_url)) {
+        changes.gone.push(previous.product_url);
+      }
+    }
+  }
+
+  return changes;
+}
+
+async function main() {
+  const startedAt = new Date();
+  const startedAtMs = Date.now();
+
+  let validRecords = [];
+  let invalidRecords = [];
+  let rawRecords = [];
+  let previousSnapshot = [];
+  let changeReport = null;
+  let fatalError = null;
+  let catalogueBooks = [];
+
+  try {
+    // Prefer the last complete baseline. Fall back to Stage 4's books.json
+    // when creating the baseline for the first time.
+    previousSnapshot = await readJsonIfExists(
+      BASELINE_FILE,
+      await readJsonIfExists(BOOKS_FILE, []),
+    );
+
+    catalogueBooks = await discoverCatalogue();
+
+    console.log("\n--- Extracting book details ---");
+    rawRecords = await extractBookDetails(catalogueBooks);
+
+    console.log("\n--- Detail extraction summary ---");
+    console.log(`detail_records=${rawRecords.length}`);
+    console.log(`failed_pages=${metrics.failedPages.length}`);
+
+    const validation = validateRecords(rawRecords);
+    validRecords = validation.validRecords;
+    invalidRecords = validation.invalidRecords;
+
+    // Save every valid record even if another page failed.
+    await writeJson(BOOKS_FILE, validRecords);
+    await writeJson(ERRORS_FILE, invalidRecords);
+
+    const detailFailures = metrics.failedPages.filter(
+      (failure) => failure.stage === "detail",
+    );
+
+    const comparisonComplete =
+      detailFailures.length === 0 &&
+      rawRecords.length === catalogueBooks.length &&
+      validRecords.length === 60 &&
+      invalidRecords.length === 0;
+
+    changeReport = compareSnapshots(
+      validRecords,
+      previousSnapshot,
+      comparisonComplete,
+    );
+
+    if (!comparisonComplete) {
+      changeReport.gone_detection_skipped_reason =
+        "The scrape was incomplete or contained invalid records.";
+    }
+
+    await writeJson(CHANGE_REPORT_FILE, changeReport);
+
+    // Only replace the baseline after a fully successful scrape.
+    if (comparisonComplete) {
+      await writeJson(BASELINE_FILE, validRecords);
+    }
+
+    console.log("\n--- Validation and storage summary ---");
+    console.log(`valid_records=${validRecords.length}`);
+    console.log(`invalid_records=${invalidRecords.length}`);
+    console.log(
+      `unique_valid_urls=${new Set(validRecords.map((book) => book.product_url)).size}`,
+    );
+    console.log(`books_output=${path.relative(process.cwd(), BOOKS_FILE)}`);
+    console.log(`errors_output=${path.relative(process.cwd(), ERRORS_FILE)}`);
+
+    console.log("\n--- Change detection summary ---");
+    console.log(`new=${changeReport.new.length}`);
+    console.log(`changed=${changeReport.changed.length}`);
+    console.log(`unchanged=${changeReport.unchanged.length}`);
+    console.log(`gone=${changeReport.gone.length}`);
+    console.log(`comparison_complete=${changeReport.comparison_complete}`);
+
+    if (detailFailures.length > 0) {
+      console.warn(
+        `${detailFailures.length} detail page(s) failed. Valid records were retained; inspect the run report.`,
+      );
+    }
+
+    if (invalidRecords.length > 0) {
+      console.warn(
+        `${invalidRecords.length} invalid record(s). Inspect output/errors.json.`,
+      );
+    }
+  } catch (error) {
+    fatalError = error;
+    console.error(`Scraper failed: ${error.message}`);
+  } finally {
+    const endedAt = new Date();
+
+    const runReport = {
+      started_at: startedAt.toISOString(),
+      ended_at: endedAt.toISOString(),
+      duration_ms: Date.now() - startedAtMs,
+      catalogue_pages_processed: metrics.cataloguePagesProcessed,
+      pages_fetched: metrics.pagesFetched,
+      cache_hits: metrics.cacheHits,
+      discovered_books: catalogueBooks.length,
+      detail_records_extracted: rawRecords.length,
+      valid_records: validRecords.length,
+      invalid_records: invalidRecords.length,
+      failed_pages: metrics.failedPages,
+      change_detection: changeReport
+        ? {
+            comparison_complete: changeReport.comparison_complete,
+            new: changeReport.new.length,
+            changed: changeReport.changed.length,
+            unchanged: changeReport.unchanged.length,
+            gone: changeReport.gone.length,
+          }
+        : null,
+      fatal_error: fatalError ? fatalError.message : null,
+    };
+
+    try {
+      await writeJson(REPORT_FILE, runReport);
+      console.log(`\nRun report saved to ${REPORT_FILE}`);
+    } catch (reportError) {
+      console.error(`Could not write run report: ${reportError.message}`);
+      fatalError = fatalError || reportError;
+    }
+  }
+
+  if (fatalError) process.exitCode = 1;
+}
+
+main();
